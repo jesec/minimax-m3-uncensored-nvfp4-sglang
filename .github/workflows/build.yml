@@ -1,0 +1,131 @@
+name: build
+
+# Builds the SGLang serving image and pushes it to a registry. This is the
+# primary way to publish it: the base layer is ~13 GB compressed and the final
+# image is ~30 GB, which does not fit on many workstations — GitHub's runners do.
+#
+# Registries:
+#   * GHCR  (ghcr.io/<owner>/<image>) — always, using the built-in GITHUB_TOKEN.
+#   * Docker Hub (<user>/<image>)     — only if the DOCKERHUB_USERNAME and
+#                                       DOCKERHUB_TOKEN repository secrets are set.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore: ['**.md', 'LICENSE*', '.gitignore']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      push:
+        description: Push the image to registries
+        type: boolean
+        default: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write        # push to GHCR
+
+env:
+  IMAGE_NAME: minimax-m3-uncensored-nvfp4-sglang
+  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      # The image is ~30 GB (~43 GB build-time peak). ubuntu-latest has only ~21 GB
+      # free on / but ~65 GB on /mnt, so we (a) trim the preinstalled toolchains and
+      # (b) move Docker's storage to /mnt. No third-party action — nothing to pin.
+      - name: Free up disk space
+        run: |
+          echo "Before:"; df -h / /mnt | tail -2
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /usr/local/share/boost /usr/local/lib/node_modules \
+                      "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" || true
+
+      - name: Move Docker storage to /mnt
+        run: |
+          # Must run before buildx creates its builder, so BuildKit's content store
+          # and snapshots (the ~43 GB peak) land on the roomy /mnt disk.
+          sudo systemctl stop docker.service docker.socket || true
+          sudo mkdir -p /mnt/docker
+          echo '{"data-root": "/mnt/docker"}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl start docker.service
+          echo "Docker root: $(docker info -f '{{.DockerRootDir}}')"
+          df -h / /mnt | tail -2
+
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Decide whether to push
+        id: decide
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "push=false" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.push }}" == "false" ]]; then
+            echo "push=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "push=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Assemble target image list
+        id: images
+        run: |
+          images="ghcr.io/${{ github.repository_owner }}/${IMAGE_NAME}"
+          if [[ -n "${DOCKERHUB_USERNAME}" ]]; then
+            images+=$'\n'"docker.io/${DOCKERHUB_USERNAME}/${IMAGE_NAME}"
+          fi
+          {
+            echo "list<<EOF"
+            echo "${images}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        if: steps.decide.outputs.push == 'true'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: steps.decide.outputs.push == 'true' && env.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compute tags and labels
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ steps.images.outputs.list }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=sha,format=short
+
+      - name: Build and push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: ${{ steps.decide.outputs.push == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Keep it a plain single-arch image (no attestation index) so every
+          # runtime — including RunPod — resolves the tag without surprises.
+          provenance: false

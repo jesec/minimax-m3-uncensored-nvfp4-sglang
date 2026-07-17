@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Never commit model weights or secrets
+model/
+*.safetensors
+.env
+*.pem

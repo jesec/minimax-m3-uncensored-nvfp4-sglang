@@ -1,0 +1,14 @@
+# Keep the build context tiny: only the Dockerfile, the sglang_patch/ files, and
+# the two runtime scripts (serve.sh, healthcheck.py) need to ship. Everything
+# else — docs, license, CI, git, local build tooling — stays out of the image.
+*.md
+LICENSE*
+build.sh
+publish.sh
+.git
+.github/
+.gitignore
+.dockerignore
+__pycache__/
+**/__pycache__/
+*.pyc
