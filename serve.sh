@@ -54,7 +54,13 @@ fi
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-$MODEL_REPO}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-30000}"
-TP_SIZE="${TP_SIZE:-4}"
+# TP defaults to the visible GPU count. This model's 64 attention heads / 4 KV
+# heads support TP of 2, 4, or 8 only (6 GPUs cannot work: 64 % 6 != 0).
+if [[ -z "${TP_SIZE:-}" ]]; then
+  TP_SIZE=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU' || true)
+  if ! [[ "$TP_SIZE" =~ ^[1-9][0-9]*$ ]]; then TP_SIZE=4; fi
+  echo "[serve] TP_SIZE=$TP_SIZE (defaulted to detected GPU count)"
+fi
 QUANTIZATION="${QUANTIZATION:-modelopt_fp4}"
 DTYPE="${DTYPE:-auto}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-32768}"
@@ -150,6 +156,18 @@ if [[ ! -e "$MODEL_PATH/config.json" ]]; then
   exit 1
 fi
 
+# --- Validated stability flags -------------------------------------------------
+# The model card's four --disable-* flags, each behind an env knob so specific
+# deployments can drop one (set the var to 0). Defaults reproduce the validated
+# 4x RTX PRO 6000 (PCIe, no NVLink) configuration. Example: on NVLink systems
+# (B200/B300) the IPC pressure that motivated disabling custom all-reduce does
+# not exist — DISABLE_CUSTOM_ALL_REDUCE=0 restores it there.
+STABILITY_FLAGS=()
+if [[ "${DISABLE_FLASHINFER_AUTOTUNE:-1}" != 0 ]];   then STABILITY_FLAGS+=(--disable-flashinfer-autotune); fi
+if [[ "${DISABLE_PREFILL_CUDA_GRAPH:-1}" != 0 ]];    then STABILITY_FLAGS+=(--disable-prefill-cuda-graph); fi
+if [[ "${DISABLE_SHARED_EXPERTS_FUSION:-1}" != 0 ]]; then STABILITY_FLAGS+=(--disable-shared-experts-fusion); fi
+if [[ "${DISABLE_CUSTOM_ALL_REDUCE:-1}" != 0 ]];     then STABILITY_FLAGS+=(--disable-custom-all-reduce); fi
+
 # EXTRA_ARGS is intentionally whitespace-split (globbing disabled so tokens with
 # * or [ ] are not rewritten against the working dir). A single flag whose VALUE
 # contains spaces (e.g. --json-model-override-args '{...}') cannot be carried this
@@ -178,8 +196,5 @@ exec python3 -m sglang.launch_server \
   --moe-runner-backend "$MOE_RUNNER_BACKEND" \
   --fp4-gemm-backend "$FP4_GEMM_BACKEND" \
   --attention-backend "$ATTENTION_BACKEND" \
-  --disable-flashinfer-autotune \
-  --disable-prefill-cuda-graph \
-  --disable-shared-experts-fusion \
-  --disable-custom-all-reduce \
-  "${EXTRA[@]}" "$@"
+  ${STABILITY_FLAGS[@]+"${STABILITY_FLAGS[@]}"} \
+  ${EXTRA[@]+"${EXTRA[@]}"} "$@"
